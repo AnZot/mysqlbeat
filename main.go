@@ -3,14 +3,13 @@ package main
 import (
 	"os"
 
-	"github.com/elastic/beats/libbeat/beat"
+	"github.com/anzot/mysqlbeat/cmd"
 
-	"github.com/adibendahan/mysqlbeat/beater"
+	_ "github.com/anzot/mysqlbeat/include"
 )
 
 func main() {
-	err := beat.Run("mysqlbeat", "", beater.New())
-	if err != nil {
+	if err := cmd.RootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }

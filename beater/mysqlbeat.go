@@ -1,10 +1,7 @@
 package beater
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"math"
 	"strconv"
@@ -12,55 +9,25 @@ import (
 	"time"
 
 	"github.com/elastic/beats/libbeat/beat"
-	"github.com/elastic/beats/libbeat/cfgfile"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 
-	"github.com/adibendahan/mysqlbeat/config"
-
-	// mysql go driver
 	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/anzot/mysqlbeat/config"
 )
 
-// Mysqlbeat is a struct to hold the beat config & info
+// Mysqlbeat configuration.
 type Mysqlbeat struct {
-	beatConfig       *config.Config
-	done             chan struct{}
-	period           time.Duration
-	hostname         string
-	port             string
-	username         string
-	password         string
-	passwordAES      string
-	queries          []string
-	queryTypes       []string
-	deltaWildcard    string
-	deltaKeyWildcard string
+	done   chan struct{}
+	config config.Config
+	client beat.Client
 
 	oldValues    common.MapStr
 	oldValuesAge common.MapStr
 }
 
-var (
-	commonIV = []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f}
-)
-
 const (
-	// secret length must be 16, 24 or 32, corresponding to the AES-128, AES-192 or AES-256 algorithms
-	// you should compile your mysqlbeat with a unique secret and hide it (don't leave it in the code after compiled)
-	// you can encrypt your password with github.com/adibendahan/mysqlbeat-password-encrypter just update your secret
-	// (and commonIV if you choose to change it) and compile.
-	secret = "github.com/adibendahan/mysqlbeat"
-
-	// default values
-	defaultPeriod           = "10s"
-	defaultHostname         = "127.0.0.1"
-	defaultPort             = "3306"
-	defaultUsername         = "mysqlbeat_user"
-	defaultPassword         = "mysqlbeat_pass"
-	defaultDeltaWildcard    = "__DELTA"
-	defaultDeltaKeyWildcard = "__DELTAKEY"
-
 	// query types values
 	queryTypeSingleRow    = "single-row"
 	queryTypeMultipleRows = "multiple-rows"
@@ -76,141 +43,69 @@ const (
 	columnTypeFloat
 )
 
-// New Creates beater
-func New() *Mysqlbeat {
-	return &Mysqlbeat{
-		done: make(chan struct{}),
-	}
-}
-
-///*** Beater interface methods ***///
-
-// Config is a function to read config file
-func (bt *Mysqlbeat) Config(b *beat.Beat) error {
-
-	// Load beater beatConfig
-	err := cfgfile.Read(&bt.beatConfig, "")
-	if err != nil {
-		return fmt.Errorf("Error reading config file: %v", err)
+// New creates an instance of mysqlbeat.
+func New(b *beat.Beat, cfg *common.Config) (beat.Beater, error) {
+	c := config.DefaultConfig
+	if err := cfg.Unpack(&c); err != nil {
+		return nil, fmt.Errorf("error reading config file: %v", err)
 	}
 
-	return nil
-}
-
-// Setup is a function to setup all beat config & info into the beat struct
-func (bt *Mysqlbeat) Setup(b *beat.Beat) error {
-
-	if len(bt.beatConfig.Mysqlbeat.Queries) < 1 {
-		err := fmt.Errorf("there are no queries to execute")
-		return err
+	if len(c.Queries) < 1 {
+		return nil, fmt.Errorf("there are no queries to execute")
 	}
-
-	if len(bt.beatConfig.Mysqlbeat.Queries) != len(bt.beatConfig.Mysqlbeat.QueryTypes) {
-		err := fmt.Errorf("error on config file, queries array length != queryTypes array length (each query should have a corresponding type on the same index)")
-		return err
-	}
-
-	// Setting defaults for missing config
-	if bt.beatConfig.Mysqlbeat.Period == "" {
-		logp.Info("Period not selected, proceeding with '%v' as default", defaultPeriod)
-		bt.beatConfig.Mysqlbeat.Period = defaultPeriod
-	}
-
-	if bt.beatConfig.Mysqlbeat.Hostname == "" {
-		logp.Info("Hostname not selected, proceeding with '%v' as default", defaultHostname)
-		bt.beatConfig.Mysqlbeat.Hostname = defaultHostname
-	}
-
-	if bt.beatConfig.Mysqlbeat.Port == "" {
-		logp.Info("Port not selected, proceeding with '%v' as default", defaultPort)
-		bt.beatConfig.Mysqlbeat.Port = defaultPort
-	}
-
-	if bt.beatConfig.Mysqlbeat.Username == "" {
-		logp.Info("Username not selected, proceeding with '%v' as default", defaultUsername)
-		bt.beatConfig.Mysqlbeat.Username = defaultUsername
-	}
-
-	if bt.beatConfig.Mysqlbeat.Password == "" && bt.beatConfig.Mysqlbeat.EncryptedPassword == "" {
-		logp.Info("Password not selected, proceeding with default password")
-		bt.beatConfig.Mysqlbeat.Password = defaultPassword
-	}
-
-	if bt.beatConfig.Mysqlbeat.DeltaWildcard == "" {
-		logp.Info("DeltaWildcard not selected, proceeding with '%v' as default", defaultDeltaWildcard)
-		bt.beatConfig.Mysqlbeat.DeltaWildcard = defaultDeltaWildcard
-	}
-
-	if bt.beatConfig.Mysqlbeat.DeltaKeyWildcard == "" {
-		logp.Info("DeltaKeyWildcard not selected, proceeding with '%v' as default", defaultDeltaKeyWildcard)
-		bt.beatConfig.Mysqlbeat.DeltaKeyWildcard = defaultDeltaKeyWildcard
-	}
-
-	// Parse the Period string
-	var durationParseError error
-	bt.period, durationParseError = time.ParseDuration(bt.beatConfig.Mysqlbeat.Period)
-	if durationParseError != nil {
-		return durationParseError
-	}
-
-	// Handle password decryption and save in the bt
-	if bt.beatConfig.Mysqlbeat.Password != "" {
-		bt.password = bt.beatConfig.Mysqlbeat.Password
-	} else if bt.beatConfig.Mysqlbeat.EncryptedPassword != "" {
-		aesCipher, err := aes.NewCipher([]byte(secret))
-		if err != nil {
-			return err
-		}
-		cfbDecrypter := cipher.NewCFBDecrypter(aesCipher, commonIV)
-		chiperText, err := hex.DecodeString(bt.beatConfig.Mysqlbeat.EncryptedPassword)
-		if err != nil {
-			return err
-		}
-		plaintextCopy := make([]byte, len(chiperText))
-		cfbDecrypter.XORKeyStream(plaintextCopy, chiperText)
-		bt.password = string(plaintextCopy)
-	}
-
-	// init the oldValues and oldValuesAge array
-	bt.oldValues = common.MapStr{"mysqlbeat": "init"}
-	bt.oldValuesAge = common.MapStr{"mysqlbeat": "init"}
-
-	// Save config values to the bt
-	bt.hostname = bt.beatConfig.Mysqlbeat.Hostname
-	bt.port = bt.beatConfig.Mysqlbeat.Port
-	bt.username = bt.beatConfig.Mysqlbeat.Username
-	bt.queries = bt.beatConfig.Mysqlbeat.Queries
-	bt.queryTypes = bt.beatConfig.Mysqlbeat.QueryTypes
-	bt.deltaWildcard = bt.beatConfig.Mysqlbeat.DeltaWildcard
-	bt.deltaKeyWildcard = bt.beatConfig.Mysqlbeat.DeltaKeyWildcard
 
 	safeQueries := true
 
-	logp.Info("Total # of queries to execute: %d", len(bt.queries))
-	for index, queryStr := range bt.queries {
+	logp.Info("Total # of queries to execute: %d", len(c.Queries))
 
-		strCleanQuery := strings.TrimSpace(strings.ToUpper(queryStr))
+	for i, query := range c.Queries {
+
+		strCleanQuery := strings.TrimSpace(strings.ToUpper(query.SQL))
 
 		if !strings.HasPrefix(strCleanQuery, "SELECT") && !strings.HasPrefix(strCleanQuery, "SHOW") || strings.ContainsAny(strCleanQuery, ";") {
 			safeQueries = false
 		}
 
-		logp.Info("Query #%d (type: %s): %s", index+1, bt.queryTypes[index], queryStr)
+		switch query.Type {
+		case
+			queryTypeSingleRow,
+			queryTypeMultipleRows,
+			queryTypeTwoColumns,
+			queryTypeSlaveDelay:
+		default:
+			err := fmt.Errorf("unknown query type: %v", query.Type)
+			return nil, err
+		}
+
+		logp.Info("Query #%d (type: %s): %s", i, query.Type, query.SQL)
+		i++
 	}
 
 	if !safeQueries {
-		err := fmt.Errorf("Only SELECT/SHOW queries are allowed (the char ; is forbidden)")
-		return err
+		err := fmt.Errorf("only SELECT/SHOW queries are allowed (the char ; is forbidden)")
+		return nil, err
 	}
 
-	return nil
+	bt := &Mysqlbeat{
+		done:         make(chan struct{}),
+		config:       c,
+		oldValues:    common.MapStr{},
+		oldValuesAge: common.MapStr{},
+	}
+	return bt, nil
 }
 
-// Run is a functions that runs the beat
+// Run starts mysqlbeat.
 func (bt *Mysqlbeat) Run(b *beat.Beat) error {
 	logp.Info("mysqlbeat is running! Hit CTRL-C to stop it.")
 
-	ticker := time.NewTicker(bt.period)
+	var err error
+	bt.client, err = b.Publisher.Connect()
+	if err != nil {
+		return err
+	}
+
+	ticker := time.NewTicker(bt.config.Period)
 	for {
 		select {
 		case <-bt.done:
@@ -225,23 +120,15 @@ func (bt *Mysqlbeat) Run(b *beat.Beat) error {
 	}
 }
 
-// Cleanup is a function that does nothing on this beat :)
-func (bt *Mysqlbeat) Cleanup(b *beat.Beat) error {
-	return nil
-}
-
-// Stop is a function that runs once the beat is stopped
+// Stop stops mysqlbeat.
 func (bt *Mysqlbeat) Stop() {
+	bt.client.Close()
 	close(bt.done)
 }
 
-///*** mysqlbeat methods ***///
-
-// beat is a function that iterate over the query array, generate and publish events
 func (bt *Mysqlbeat) beat(b *beat.Beat) error {
-
 	// Build the MySQL connection string
-	connString := fmt.Sprintf("%v:%v@tcp(%v:%v)/", bt.username, bt.password, bt.hostname, bt.port)
+	connString := fmt.Sprintf("%v:%v@tcp(%v:%v)/", bt.config.Username, bt.config.Password, bt.config.Hostname, bt.config.Port)
 
 	db, err := sql.Open("mysql", connString)
 	if err != nil {
@@ -249,98 +136,91 @@ func (bt *Mysqlbeat) beat(b *beat.Beat) error {
 	}
 	defer db.Close()
 
-	// Create a two-columns event for later use
-	var twoColumnEvent common.MapStr
-
-LoopQueries:
-	for index, queryStr := range bt.queries {
-		// Log the query run time and run the query
-		dtNow := time.Now()
-		rows, err := db.Query(queryStr)
+	for i, query := range bt.config.Queries {
+		events, err := bt.iterateQuery(db, i, query.Type, query.SQL)
 		if err != nil {
 			return err
 		}
 
-		// Populate columns array
-		columns, err := rows.Columns()
-		if err != nil {
-			return err
+		for _, event := range events {
+			bt.client.Publish(*event)
 		}
 
-		// Populate the two-columns event
-		if bt.queryTypes[index] == queryTypeTwoColumns {
-			twoColumnEvent = common.MapStr{
-				"@timestamp": common.Time(dtNow),
-				"type":       queryTypeTwoColumns,
-			}
-		}
-
-	LoopRows:
-		for rows.Next() {
-
-			switch bt.queryTypes[index] {
-			case queryTypeSingleRow, queryTypeSlaveDelay:
-				// Generate an event from the current row
-				event, err := bt.generateEventFromRow(rows, columns, bt.queryTypes[index], dtNow)
-
-				if err != nil {
-					logp.Err("Query #%v error generating event from rows: %v", index+1, err)
-				} else if event != nil {
-					b.Events.PublishEvent(event)
-					logp.Info("%v event sent", bt.queryTypes[index])
-				}
-				// breaking after the first row
-				break LoopRows
-
-			case queryTypeMultipleRows:
-				// Generate an event from the current row
-				event, err := bt.generateEventFromRow(rows, columns, bt.queryTypes[index], dtNow)
-
-				if err != nil {
-					logp.Err("Query #%v error generating event from rows: %v", index+1, err)
-					break LoopRows
-				} else if event != nil {
-					b.Events.PublishEvent(event)
-					logp.Info("%v event sent", bt.queryTypes[index])
-				}
-
-				// Move to the next row
-				continue LoopRows
-
-			case queryTypeTwoColumns:
-				// append current row to the two-columns event
-				err := bt.appendRowToEvent(twoColumnEvent, rows, columns, dtNow)
-
-				if err != nil {
-					logp.Err("Query #%v error appending two-columns event: %v", index+1, err)
-					break LoopRows
-				}
-
-				// Move to the next row
-				continue LoopRows
-			}
-		}
-
-		// If the two-columns event has data, publish it
-		if bt.queryTypes[index] == queryTypeTwoColumns && len(twoColumnEvent) > 2 {
-			b.Events.PublishEvent(twoColumnEvent)
-			logp.Info("%v event sent", queryTypeTwoColumns)
-			twoColumnEvent = nil
-		}
-
-		rows.Close()
-		if err = rows.Err(); err != nil {
-			logp.Err("Query #%v error closing rows: %v", index+1, err)
-			continue LoopQueries
-		}
+		i++
 	}
 
-	// Great success!
 	return nil
 }
 
+func (bt *Mysqlbeat) iterateQuery(db *sql.DB, i int, queryType string, queryStr string) ([]*beat.Event, error) {
+	// Log the query run time and run the query
+	dtNow := time.Now()
+	rows, err := db.Query(queryStr)
+	if err != nil {
+		logp.L().Error("Query #%v error generating event from rows: %v", i, err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Populate columns array
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var events []*beat.Event
+
+	switch queryType {
+	case queryTypeSingleRow, queryTypeSlaveDelay:
+		rows.Next()
+		event, err := bt.generateEventFromRow(rows, columns, queryType, dtNow)
+		if event != nil {
+			events = append(events, event)
+		}
+
+		return events, err
+
+	case queryTypeMultipleRows:
+		for rows.Next() {
+			event, err := bt.generateEventFromRow(rows, columns, queryType, dtNow)
+
+			if err != nil {
+				return events, err
+			} else if event != nil {
+				events = append(events, event)
+			}
+		}
+
+		return events, err
+
+	case queryTypeTwoColumns:
+		event, err := bt.generateEmptyEvent(queryType, dtNow)
+		if err != nil {
+			return events, err
+		}
+
+		for rows.Next() {
+			err := bt.appendRowToEvent(event, rows, columns, dtNow)
+
+			if err != nil {
+				return events, err
+			}
+		}
+
+		if event != nil {
+			events = append(events, event)
+		}
+
+		return events, err
+	}
+
+	err = fmt.Errorf("unknown query type: %v", queryType)
+
+	return events, err
+}
+
 // appendRowToEvent appends the two-column event the current row data
-func (bt *Mysqlbeat) appendRowToEvent(event common.MapStr, row *sql.Rows, columns []string, rowAge time.Time) error {
+func (bt *Mysqlbeat) appendRowToEvent(event *beat.Event, row *sql.Rows, columns []string, rowAge time.Time) error {
 
 	// Make a slice for the values
 	values := make([]sql.RawBytes, len(columns))
@@ -361,7 +241,7 @@ func (bt *Mysqlbeat) appendRowToEvent(event common.MapStr, row *sql.Rows, column
 	strColName := string(values[0])
 	strColValue := string(values[1])
 	strColType := columnTypeString
-	strEventColName := strings.Replace(strColName, bt.deltaWildcard, "_PERSECOND", 1)
+	strEventColName := strings.Replace(strColName, bt.config.DeltaWildcard, "_PERSECOND", 1)
 
 	// Try to parse the value to an int64
 	nColValue, err := strconv.ParseInt(strColValue, 0, 64)
@@ -379,7 +259,7 @@ func (bt *Mysqlbeat) appendRowToEvent(event common.MapStr, row *sql.Rows, column
 	}
 
 	// If the column name ends with the deltaWildcard
-	if strings.HasSuffix(strColName, bt.deltaWildcard) {
+	if strings.HasSuffix(strColName, bt.config.DeltaWildcard) {
 		var exists bool
 		_, exists = bt.oldValues[strColName]
 
@@ -407,7 +287,7 @@ func (bt *Mysqlbeat) appendRowToEvent(event common.MapStr, row *sql.Rows, column
 					oldVal, _ := bt.oldValues[strColName].(int64)
 					if nColValue > oldVal {
 						// Calculate the delta
-						devResult := float64((nColValue - oldVal)) / float64(delta.Seconds())
+						devResult := float64(nColValue-oldVal) / float64(delta.Seconds())
 						// Round the calculated result back to an int64
 						calcVal = roundF2I(devResult, .5)
 					} else {
@@ -415,7 +295,7 @@ func (bt *Mysqlbeat) appendRowToEvent(event common.MapStr, row *sql.Rows, column
 					}
 
 					// Add the delta value to the event
-					event[strEventColName] = calcVal
+					event.Fields[strEventColName] = calcVal
 
 					// Save current values as old values
 					bt.oldValues[strColName] = nColValue
@@ -433,23 +313,23 @@ func (bt *Mysqlbeat) appendRowToEvent(event common.MapStr, row *sql.Rows, column
 					}
 
 					// Add the delta value to the event
-					event[strEventColName] = calcVal
+					event.Fields[strEventColName] = calcVal
 
 					// Save current values as old values
 					bt.oldValues[strColName] = fColValue
 					bt.oldValuesAge[strColName] = rowAge
 				} else {
-					event[strEventColName] = strColValue
+					event.Fields[strEventColName] = strColValue
 				}
 			}
 		}
 	} else { // Not a delta column, add the value to the event as is
 		if strColType == columnTypeString {
-			event[strEventColName] = strColValue
+			event.Fields[strEventColName] = strColValue
 		} else if strColType == columnTypeInt {
-			event[strEventColName] = nColValue
+			event.Fields[strEventColName] = nColValue
 		} else if strColType == columnTypeFloat {
-			event[strEventColName] = fColValue
+			event.Fields[strEventColName] = fColValue
 		}
 	}
 
@@ -457,8 +337,23 @@ func (bt *Mysqlbeat) appendRowToEvent(event common.MapStr, row *sql.Rows, column
 	return nil
 }
 
+func (bt *Mysqlbeat) generateEmptyEvent(queryType string, rowAge time.Time) (*beat.Event, error) {
+	event := &beat.Event{
+		Timestamp: rowAge,
+		Fields: common.MapStr{
+			"type": queryType,
+		},
+	}
+
+	return event, nil
+}
+
 // generateEventFromRow creates a new event from the row data and returns it
-func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, queryType string, rowAge time.Time) (common.MapStr, error) {
+func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, queryType string, rowAge time.Time) (*beat.Event, error) {
+	event, err := bt.generateEmptyEvent(queryType, rowAge)
+	if err != nil {
+		return nil, err
+	}
 
 	// Make a slice for the values
 	values := make([]sql.RawBytes, len(columns))
@@ -469,14 +364,8 @@ func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, query
 		scanArgs[i] = &values[i]
 	}
 
-	// Create the event and populate it
-	event := common.MapStr{
-		"@timestamp": common.Time(rowAge),
-		"type":       queryType,
-	}
-
 	// Get RawBytes from data
-	err := row.Scan(scanArgs...)
+	err = row.Scan(scanArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +377,7 @@ func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, query
 		strColValue := string(col)
 		strColType := columnTypeString
 
-		// Skip column proccessing when query type is show-slave-delay and the column isn't Seconds_Behind_Master
+		// Skip column processing when query type is show-slave-delay and the column isn't Seconds_Behind_Master
 		if queryType == queryTypeSlaveDelay && strColName != columnNameSlaveDelay {
 			continue
 		}
@@ -497,10 +386,10 @@ func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, query
 		strEventColName := strColName
 
 		// Remove unneeded suffix, add _PERSECOND to calculated columns
-		if strings.HasSuffix(strColName, bt.deltaKeyWildcard) {
-			strEventColName = strings.Replace(strColName, bt.deltaKeyWildcard, "", 1)
-		} else if strings.HasSuffix(strColName, bt.deltaWildcard) {
-			strEventColName = strings.Replace(strColName, bt.deltaWildcard, "_PERSECOND", 1)
+		if strings.HasSuffix(strColName, bt.config.DeltaKeyWildcard) {
+			strEventColName = strings.Replace(strColName, bt.config.DeltaKeyWildcard, "", 1)
+		} else if strings.HasSuffix(strColName, bt.config.DeltaWildcard) {
+			strEventColName = strings.Replace(strColName, bt.config.DeltaWildcard, "_PERSECOND", 1)
 		}
 
 		// Try to parse the value to an int64
@@ -519,7 +408,7 @@ func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, query
 		}
 
 		// If the column name ends with the deltaWildcard
-		if (queryType == queryTypeSingleRow || queryType == queryTypeMultipleRows) && strings.HasSuffix(strColName, bt.deltaWildcard) {
+		if (queryType == queryTypeSingleRow || queryType == queryTypeMultipleRows) && strings.HasSuffix(strColName, bt.config.DeltaWildcard) {
 
 			var strKey string
 
@@ -565,7 +454,7 @@ func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, query
 
 						if nColValue > oldVal {
 							// Calculate the delta
-							devResult := float64((nColValue - oldVal)) / float64(delta.Seconds())
+							devResult := float64(nColValue-oldVal) / float64(delta.Seconds())
 							// Round the calculated result back to an int64
 							calcVal = roundF2I(devResult, .5)
 						} else {
@@ -573,7 +462,7 @@ func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, query
 						}
 
 						// Add the delta value to the event
-						event[strEventColName] = calcVal
+						event.Fields[strEventColName] = calcVal
 
 						// Save current values as old values
 						bt.oldValues[strKey] = nColValue
@@ -590,30 +479,30 @@ func (bt *Mysqlbeat) generateEventFromRow(row *sql.Rows, columns []string, query
 						}
 
 						// Add the delta value to the event
-						event[strEventColName] = calcVal
+						event.Fields[strEventColName] = calcVal
 
 						// Save current values as old values
 						bt.oldValues[strKey] = fColValue
 						bt.oldValuesAge[strKey] = rowAge
 					} else {
-						event[strEventColName] = strColValue
+						event.Fields[strEventColName] = strColValue
 					}
 				}
 			}
 		} else { // Not a delta column, add the value to the event as is
 			if strColType == columnTypeString {
-				event[strEventColName] = strColValue
+				event.Fields[strEventColName] = strColValue
 			} else if strColType == columnTypeInt {
-				event[strEventColName] = nColValue
+				event.Fields[strEventColName] = nColValue
 			} else if strColType == columnTypeFloat {
-				event[strEventColName] = fColValue
+				event.Fields[strEventColName] = fColValue
 			}
 		}
 	}
 
 	// If the event has no data, set to nil
-	if len(event) == 2 {
-		event = nil
+	if len(event.Fields) == 1 {
+		event.Fields = nil
 	}
 
 	return event, nil
@@ -627,7 +516,7 @@ func getKeyFromRow(bt *Mysqlbeat, values []sql.RawBytes, columns []string) (strK
 	// Loop on all columns
 	for i, col := range values {
 		// Get column name and string value
-		if strings.HasSuffix(string(columns[i]), bt.deltaKeyWildcard) {
+		if strings.HasSuffix(string(columns[i]), bt.config.DeltaKeyWildcard) {
 			strKey += string(col)
 			keyFound = true
 		}

@@ -1,65 +1,116 @@
-# mysqlbeat
-Fully customizable Beat for MySQL server - this beat will ship the results of any query defined in the config file to Elasticsearch.
+# Mysqlbeat
 
+Welcome to Mysqlbeat.
 
-## Current status
- First beta release [available here](https://github.com/adibendahan/mysqlbeat/releases/tag/1.0.0).
+Ensure that this folder is at the following location:
+`${GOPATH}/src/github.com/anzot/mysqlbeat`
 
-## Features
+## Getting Started with Mysqlbeat
 
-* Connect to any MySQL server and run queries
- * `single-row` queries will be translated as columnname:value.
- * `two-columns` will be translated as value-column1:value-column2 for each row.
- * `multiple-rows` each row will be a document (with columnname:value) **NEW:** Added DELTA support.
- * `show-slave-delay` will only send the "Seconds_Behind_Master" column from `SHOW SLAVE STATUS;`
-* Any column that ends with the delatwildcard (default is __DELTA) will send delta results, extremely useful for server counters.
-  `((newval - oldval)/timediff.Seconds())`
-* MySQL Performance Dashboard (more details below)
+### Requirements
 
-## How to Build
+* [Golang](https://golang.org/dl/) 1.7
 
-mysqlbeat uses Glide for dependency management. To install glide see: https://github.com/Masterminds/glide
+### Init Project
+To get running with Mysqlbeat and also install the
+dependencies, run the following command:
 
-```shell
-$ glide update --no-recursive
-$ make
+```
+make setup
 ```
 
-## Default Configuration
+It will create a clean git history for each major step. Note that you can always rewrite the history if you wish before pushing your changes.
 
-Edit mysqlbeat configuration in ```mysqlbeat.yml``` .
-You can:
- * Add queries to the `queries` array
- * Add query types to the `querytypes` array
- * Define Username/Password to connect to the MySQL
- * Define the column wild card for delta columns
- * Define the column wild card for delta key columns 
- * Password can be saved in clear text/AES encryption
+To push Mysqlbeat in the git repository, run the following commands:
 
-If you choose to use the mysqlbeat as is, just run the following on your MySQL Server:
-  ```
-   GRANT REPLICATION CLIENT, PROCESS ON *.* TO 'mysqlbeat_user'@'%' IDENTIFIED BY 'mysqlbeat_pass';
-  ```
+```
+git remote set-url origin https://github.com/anzot/mysqlbeat
+git push origin master
+```
 
-Notes on password encryption: Before you compile your own mysqlbeat, you should put a new secret in the code (defined as a const), secret length must be 16, 24 or 32, corresponding to the AES-128, AES-192 or AES-256 algorithm. I recommend deleting the secret from the source code after you have your compiled mysqlbeat. You can encrypt your password with [mysqlbeat-password-encrypter](github.com/adibendahan/mysqlbeat-password-encrypter, "github.com/adibendahan/mysqlbeat-password-encrypter") just update your secret (and commonIV if you choose to change it) and compile.
+For further development, check out the [beat developer guide](https://www.elastic.co/guide/en/beats/libbeat/current/new-beat.html).
 
-## Template
- The default template is provided, if you add any queries you should update the template accordingly.
- 
- To apply the default template run:
- 	```
- 	 curl -XPUT http://<host>:9200/_template/mysqlbeat -d@etc/mysqlbeat-template.json
- 	```
+### Build
 
-## How to use
-Just run ```mysqlbeat -c mysqlbeat.yml``` and you are good to go.
+To build the binary for Mysqlbeat run the command below. This will generate a binary
+in the same directory with the name mysqlbeat.
 
-## MySQL Performance Dashboard by mysqlbeat
-This dashboard created as an addition to the MySQL dashboard provided by packetbeat, use them both.
-Run the default configuration provided to get the dashboard below (you should import ```dashboard/mysql_performance_dashboard_by_mysqlbeat.json``` to create the dashboard in Kibana).
-
-![mysql_performance_by_mysqlbeat__dashboard__kibana](https://cloud.githubusercontent.com/assets/2807536/14936629/3a3b88e8-0efa-11e6-87ef-eb864498d3ab.png)
+```
+make
+```
 
 
-## License
-GNU General Public License v2
+### Run
+
+To run Mysqlbeat with debugging output enabled, run:
+
+```
+./mysqlbeat -c mysqlbeat.yml -e -d "*"
+```
+
+
+### Test
+
+To test Mysqlbeat, run the following command:
+
+```
+make testsuite
+```
+
+alternatively:
+```
+make unit-tests
+make system-tests
+make integration-tests
+make coverage-report
+```
+
+The test coverage is reported in the folder `./build/coverage/`
+
+### Update
+
+Each beat has a template for the mapping in elasticsearch and a documentation for the fields
+which is automatically generated based on `fields.yml` by running the following command.
+
+```
+make update
+```
+
+
+### Cleanup
+
+To clean  Mysqlbeat source code, run the following command:
+
+```
+make fmt
+```
+
+To clean up the build directory and generated artifacts, run:
+
+```
+make clean
+```
+
+
+### Clone
+
+To clone Mysqlbeat from the git repository, run the following commands:
+
+```
+mkdir -p ${GOPATH}/src/github.com/anzot/mysqlbeat
+git clone https://github.com/anzot/mysqlbeat ${GOPATH}/src/github.com/anzot/mysqlbeat
+```
+
+
+For further development, check out the [beat developer guide](https://www.elastic.co/guide/en/beats/libbeat/current/new-beat.html).
+
+
+## Packaging
+
+The beat frameworks provides tools to crosscompile and package your beat for different platforms. This requires [docker](https://www.docker.com/) and vendoring as described above. To build packages of your beat, run the following command:
+
+```
+make release
+```
+
+This will fetch and create all images required for the build process. The whole process to finish can take several minutes.

@@ -1,0 +1,9 @@
+- key: mysqlbeat
+  title: mysqlbeat
+  description:
+  fields:
+    - name: counter
+      type: long
+      required: true
+      description: >
+        PLEASE UPDATE DOCUMENTATION
